@@ -46,7 +46,8 @@ class ClusterTopology {
   static ClusterTopology detect(
       const std::string& sysRoot, std::vector<int> allowedCpus);
 
-  // Detected once from /sys/devices/system and the process affinity.
+  // Detected once from /sys/devices/system and the process affinity; never
+  // destroyed.
   static const ClusterTopology& instance();
 
   const std::vector<CpuCluster>& clusters() const { return clusters_; }

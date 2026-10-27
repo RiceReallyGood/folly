@@ -27,6 +27,7 @@
 #include <utility>
 
 #include <folly/Conv.h>
+#include <folly/Indestructible.h>
 #include <folly/Optional.h>
 #include <folly/String.h>
 
@@ -228,8 +229,11 @@ ClusterTopology ClusterTopology::detect(
 }
 
 const ClusterTopology& ClusterTopology::instance() {
-  static const ClusterTopology topo = detect("/sys/devices/system", {});
-  return topo;
+  // Never destroyed: pool threads (e.g. ClusterAwareBlockingQueue workers) may
+  // still use it while static destructors run at exit.
+  static const Indestructible<ClusterTopology> topo{
+      detect("/sys/devices/system", {})};
+  return *topo;
 }
 
 int ClusterTopology::clusterOfCpu(int cpu) const {
