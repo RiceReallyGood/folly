@@ -147,23 +147,43 @@ class ClusterAwareBlockingQueue : public BlockingQueue<T> {
 
   // Wakes an idle worker of `cluster`, else of its nearest neighbor that has
   // one, for an item just enqueued.
+  //
+  // `idle` counts announced, unclaimed idle workers. A producer claims one
+  // (decrements) before posting, so back-to-back items wake distinct workers
+  // instead of piling wakeups on a cluster whose idle worker is already
+  // being woken.
   BlockingQueueAddResult wakeIdleWorker(int cluster) {
     // Pairs with the fence in waitIdle(): either we see the idle worker or
     // it sees the item when it rechecks.
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    auto& sub = subs_[cluster];
-    if (sub.idle.load(std::memory_order_relaxed) > 0) {
-      sub.sem.post();
+    if (claimIdle(subs_[cluster])) {
       return BlockingQueueAddResult(true);
     }
     for (int n : neighbors(cluster)) {
-      auto& other = subs_[n];
-      if (other.idle.load(std::memory_order_relaxed) > 0) {
-        other.sem.post();
+      if (claimIdle(subs_[n])) {
         return BlockingQueueAddResult(true);
       }
     }
     return BlockingQueueAddResult(false);
+  }
+
+  // Takes one idle worker of `sub` and wakes it.
+  static bool claimIdle(Sub& sub) {
+    if (!decrementIfPositive(sub.idle)) {
+      return false;
+    }
+    sub.sem.post();
+    return true;
+  }
+
+  static bool decrementIfPositive(std::atomic<int>& n) {
+    int v = n.load(std::memory_order_relaxed);
+    while (v > 0) {
+      if (n.compare_exchange_weak(v, v - 1, std::memory_order_relaxed)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   const std::vector<int>& neighbors(int cluster) const {
@@ -189,18 +209,22 @@ class ClusterAwareBlockingQueue : public BlockingQueue<T> {
   }
 
   // Announces worker `w` as idle, rechecks the queues and, if still empty,
-  // blocks via `wait`. Returns an item found by the recheck, else none (the
-  // caller retries; wakeups may be spurious).
+  // blocks via `wait` (false = timed out). A worker woken by a producer was
+  // already un-announced by it; otherwise the worker withdraws its
+  // announcement, or, if a producer claimed it meanwhile, absorbs the post
+  // that producer makes. Returns an item found by the recheck, else none
+  // (the caller retries).
   template <class Wait>
   folly::Optional<T> waitIdle(int w, Wait&& wait) {
     auto& sub = subs_[w];
     sub.idle.fetch_add(1, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_seq_cst);
     auto item = tryDequeue(w);
-    if (!item) {
-      wait(sub.sem);
+    if (item || !wait(sub.sem)) {
+      if (!decrementIfPositive(sub.idle)) {
+        sub.sem.wait();
+      }
     }
-    sub.idle.fetch_sub(1, std::memory_order_relaxed);
     return item;
   }
 

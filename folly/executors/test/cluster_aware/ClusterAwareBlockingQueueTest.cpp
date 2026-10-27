@@ -121,6 +121,37 @@ TEST(ClusterAwareBlockingQueue, IdleRemoteWorkerIsWokenWhenLocalHasNone) {
   worker.join();
 }
 
+// Back-to-back items must wake distinct idle workers, even when they sit in
+// different clusters: waking the same cluster twice would leave the second
+// item waiting for the first one to finish (or forever, if that worker exits).
+TEST(ClusterAwareBlockingQueue, ConsecutiveItemsWakeDistinctIdleWorkers) {
+  ClusterAwareBlockingQueue<int> q(fourClusters());
+  std::promise<int> got1;
+  std::promise<int> got2;
+  std::thread w1([&] {
+    HomeCluster home(1);
+    got1.set_value(q.take());
+  });
+  std::thread w2([&] {
+    HomeCluster home(2);
+    got2.set_value(q.take());
+  });
+  ASSERT_TRUE(waitUntil([&] { return q.idleWorkers() == 2; }, 1000ms));
+  q.addToCluster(0, 1);
+  q.addToCluster(0, 2);
+  auto f1 = got1.get_future();
+  auto f2 = got2.get_future();
+  bool both = f1.wait_for(1s) == std::future_status::ready &&
+      f2.wait_for(1s) == std::future_status::ready;
+  EXPECT_TRUE(both);
+  if (!both) {
+    q.addToCluster(1, -1); // unblock whoever is still waiting
+    q.addToCluster(2, -1);
+  }
+  w1.join();
+  w2.join();
+}
+
 TEST(ClusterAwareBlockingQueue, BusyRemoteWorkerPicksUpTaskFromWorkerlessCluster) {
   ClusterAwareBlockingQueue<int> q(fourClusters());
   std::promise<int> second;
