@@ -15,10 +15,13 @@
  */
 
 #include <atomic>
+#include <future>
 #include <thread>
 #include <vector>
 
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/executors/ClusterAwareExecutor.h>
+#include <folly/io/async/Request.h>
 #include <folly/executors/ClusterTopology.h>
 #include <folly/executors/task_queue/ClusterAwareBlockingQueue.h>
 #include <folly/executors/thread_factory/ClusterAffinityThreadFactory.h>
@@ -101,4 +104,77 @@ TEST(ClusterAwareExecutor, JoinDoesNotHangWithRemoteProducer) {
       },
       10s);
   EXPECT_EQ(done.load(), 1000);
+}
+
+// ClusterAwareExecutor: lean pool (no CPUThreadPoolExecutor bookkeeping)
+// running tasks from a ClusterAwareBlockingQueue.
+
+TEST(ClusterAwareExecutor, LeanExecutorRunsAllTasksAndDrainsOnDestruction) {
+  const auto& topo = ClusterTopology::instance();
+  std::atomic<int> done{0};
+  std::atomic<int> badHome{0};
+  runWithTimeout(
+      [&] {
+        ClusterAwareExecutor ex(
+            2 * topo.size(),
+            topo,
+            std::make_shared<ClusterAffinityThreadFactory>(
+                std::make_shared<NamedThreadFactory>("lean"), topo));
+        std::vector<std::thread> producers;
+        for (int p = 0; p < 4; ++p) {
+          producers.emplace_back([&] {
+            for (int n = 0; n < 25000; ++n) {
+              ex.add([&] {
+                if (currentThreadCluster() < 0) {
+                  ++badHome;
+                }
+                ++done;
+              });
+            }
+          });
+        }
+        for (auto& t : producers) {
+          t.join();
+        }
+      }, // ~ClusterAwareExecutor runs everything still queued
+      60s);
+  EXPECT_EQ(done.load(), 100000);
+  EXPECT_EQ(badHome.load(), 0);
+}
+
+TEST(ClusterAwareExecutor, LeanExecutorPropagatesRequestContext) {
+  const auto& topo = ClusterTopology::instance();
+  ClusterAwareExecutor ex(
+      2, topo, std::make_shared<NamedThreadFactory>("lean"));
+  folly::RequestContextScopeGuard guard;
+  auto* expected = folly::RequestContext::get();
+  std::promise<folly::RequestContext*> seen;
+  ex.add([&] { seen.set_value(folly::RequestContext::get()); });
+  EXPECT_EQ(seen.get_future().get(), expected);
+}
+
+TEST(ClusterAwareExecutor, SingleGroupQueueTopologyIsAGlobalQueue) {
+  const auto& real = ClusterTopology::instance();
+  std::vector<int> cpus;
+  for (const auto& c : real.clusters()) {
+    cpus.insert(cpus.end(), c.cpus.begin(), c.cpus.end());
+  }
+  auto single = ClusterTopology::detect("/nonexistent", cpus);
+  ASSERT_EQ(single.size(), 1);
+  std::atomic<int> done{0};
+  {
+    ClusterAwareExecutor ex(
+        4,
+        single,
+        std::make_shared<ClusterAffinityThreadFactory>(
+            std::make_shared<NamedThreadFactory>("lean"), real));
+    for (int n = 0; n < 1000; ++n) {
+      ex.add([&] { ++done; });
+    }
+    while (done.load() < 1000) {
+      std::this_thread::yield();
+    }
+    EXPECT_EQ(ex.stats().stolenTakes, 0u);
+    EXPECT_EQ(ex.stats().localTakes, 1000u);
+  }
 }
