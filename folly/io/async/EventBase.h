@@ -918,6 +918,9 @@ class EventBase : public TimeoutManager,
    */
   bool nothingHandledYet() const noexcept;
 
+  // Called after a loop callback is queued for a later pass of loopMain().
+  void breakBackendLoopForCallbacks();
+
   typedef LoopCallback::List LoopCallbackList;
 
   bool loopBody(int flags = 0, bool ignoreKeepAlive = false);

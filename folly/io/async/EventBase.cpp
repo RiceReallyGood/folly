@@ -115,6 +115,17 @@ class ExecutionObserverScopeGuard {
   folly::ExecutionObserver* observer_;
   uintptr_t id_;
 };
+
+// The EventBase whose backend loop (eb_event_base_loop) is running on this
+// thread, if any, and whether that loop was already asked to exit. libevent's
+// EVLOOP_ONCE does not return after a round that processed only internal
+// events (such as the notification queues), so a loop callback scheduled from
+// such a handler would otherwise wait for the next external event.
+struct BackendLoopState {
+  folly::EventBase* evb{nullptr};
+  bool exitScheduled{false};
+};
+thread_local BackendLoopState tlsBackendLoop;
 } // namespace
 
 namespace folly {
@@ -396,11 +407,13 @@ bool EventBase::loopMain(int flags, bool ignoreKeepAlive) {
 
     // nobody can add loop callbacks from within this thread if
     // we don't have to handle anything to start with...
+    auto prevBackendLoop = std::exchange(tlsBackendLoop, {this, false});
     if (blocking && loopCallbacks_.empty()) {
       res = evb_->eb_event_base_loop(EVLOOP_ONCE);
     } else {
       res = evb_->eb_event_base_loop(EVLOOP_ONCE | EVLOOP_NONBLOCK);
     }
+    tlsBackendLoop = prevBackendLoop;
 
     ranLoopCallbacks = runLoopCallbacks();
 
@@ -598,6 +611,7 @@ void EventBase::runInLoop(
     runOnceCallbacks_->push_back(*callback);
   } else {
     loopCallbacks_.push_back(*callback);
+    breakBackendLoopForCallbacks();
   }
 }
 
@@ -609,6 +623,21 @@ void EventBase::runInLoop(Func cob, bool thisIteration) {
     runOnceCallbacks_->push_back(*wrapper);
   } else {
     loopCallbacks_.push_back(*wrapper);
+    breakBackendLoopForCallbacks();
+  }
+}
+
+void EventBase::breakBackendLoopForCallbacks() {
+  // Scheduled from inside the backend loop (an event handler): have libevent
+  // return once the currently active events have run, so loopMain() runs the
+  // callback before blocking again. A NULL timeout activates the exit event
+  // immediately at the tail of the active queue.
+  auto& state = tlsBackendLoop;
+  if (state.evb == this && !state.exitScheduled) {
+    if (auto* base = evb_->getEventBase()) {
+      event_base_loopexit(base, nullptr);
+      state.exitScheduled = true;
+    }
   }
 }
 
