@@ -275,6 +275,9 @@ void setCurrentThreadCluster(int cluster) {
 }
 
 int callerCluster(const ClusterTopology& topo) {
+  if (topo.size() <= 1) {
+    return 0;
+  }
   int home = tlsCluster;
   if (home >= 0 && static_cast<size_t>(home) < topo.size()) {
     return home;

@@ -26,8 +26,11 @@
 #include <folly/concurrency/UnboundedQueue.h>
 #include <folly/executors/ClusterTopology.h>
 #include <folly/executors/task_queue/BlockingQueue.h>
+#include <mutex>
+
 #include <folly/lang/Align.h>
-#include <folly/synchronization/LifoSem.h>
+#include <folly/synchronization/Baton.h>
+#include <folly/synchronization/MicroSpinLock.h>
 
 namespace folly {
 
@@ -80,8 +83,8 @@ class ClusterAwareBlockingQueue : public BlockingQueue<T> {
       if (auto item = tryDequeue(w)) {
         return std::move(*item);
       }
-      if (auto item = waitIdle(w, [&](LifoSem& sem) {
-            sem.wait();
+      if (auto item = waitIdle(w, [&](Baton<>& baton) {
+            baton.wait();
             return true;
           })) {
         return std::move(*item);
@@ -97,8 +100,8 @@ class ClusterAwareBlockingQueue : public BlockingQueue<T> {
         return item;
       }
       bool timedOut = false;
-      if (auto item = waitIdle(w, [&](LifoSem& sem) {
-            timedOut = !sem.try_wait_until(deadline);
+      if (auto item = waitIdle(w, [&](Baton<>& baton) {
+            timedOut = !baton.try_wait_until(deadline);
             return !timedOut;
           })) {
         return item;
@@ -137,21 +140,31 @@ class ClusterAwareBlockingQueue : public BlockingQueue<T> {
   }
 
  private:
+  // An idle worker blocked in take(); lives on that worker's stack.
+  struct Waiter {
+    Baton<> baton;
+    Waiter* prev{nullptr};
+    Waiter* next{nullptr};
+    bool listed{false};
+  };
+
   struct alignas(hardware_destructive_interference_size) Sub {
     UMPMCQueue<T, false, 6> queue;
-    LifoSem sem;
-    std::atomic<int> idle{0};
-    std::atomic<uint64_t> localTakes{0};
+    // Idle workers of this cluster, most recent first, guarded by `lock`.
+    MicroSpinLock lock{0};
+    Waiter* idleHead{nullptr};
+    std::atomic<int> idle{0}; // == length of the idle list
+    alignas(hardware_destructive_interference_size)
+        std::atomic<uint64_t> localTakes{0};
     std::atomic<uint64_t> stolenTakes{0};
   };
 
   // Wakes an idle worker of `cluster`, else of its nearest neighbor that has
   // one, for an item just enqueued.
   //
-  // `idle` counts announced, unclaimed idle workers. A producer claims one
-  // (decrements) before posting, so back-to-back items wake distinct workers
-  // instead of piling wakeups on a cluster whose idle worker is already
-  // being woken.
+  // A producer claims one specific idle worker (unlinks it) and posts that
+  // worker's own baton, so back-to-back items wake distinct workers and a
+  // claimed wakeup cannot be consumed by another worker.
   BlockingQueueAddResult wakeIdleWorker(int cluster) {
     // Pairs with the fence in waitIdle(): either we see the idle worker or
     // it sees the item when it rechecks.
@@ -167,23 +180,36 @@ class ClusterAwareBlockingQueue : public BlockingQueue<T> {
     return BlockingQueueAddResult(false);
   }
 
-  // Takes one idle worker of `sub` and wakes it.
+  // Takes the most recently idle worker of `sub` and wakes it.
   static bool claimIdle(Sub& sub) {
-    if (!decrementIfPositive(sub.idle)) {
+    if (sub.idle.load(std::memory_order_relaxed) == 0) {
       return false;
     }
-    sub.sem.post();
+    Waiter* waiter;
+    {
+      std::lock_guard<MicroSpinLock> g(sub.lock);
+      waiter = sub.idleHead;
+      if (!waiter) {
+        return false;
+      }
+      unlink(sub, *waiter);
+    }
+    waiter->baton.post();
     return true;
   }
 
-  static bool decrementIfPositive(std::atomic<int>& n) {
-    int v = n.load(std::memory_order_relaxed);
-    while (v > 0) {
-      if (n.compare_exchange_weak(v, v - 1, std::memory_order_relaxed)) {
-        return true;
-      }
+  // Requires sub.lock.
+  static void unlink(Sub& sub, Waiter& w) {
+    if (w.prev) {
+      w.prev->next = w.next;
+    } else {
+      sub.idleHead = w.next;
     }
-    return false;
+    if (w.next) {
+      w.next->prev = w.prev;
+    }
+    w.listed = false;
+    sub.idle.fetch_sub(1, std::memory_order_relaxed);
   }
 
   const std::vector<int>& neighbors(int cluster) const {
@@ -208,21 +234,39 @@ class ClusterAwareBlockingQueue : public BlockingQueue<T> {
     return lowPri_.try_dequeue();
   }
 
-  // Announces worker `w` as idle, rechecks the queues and, if still empty,
-  // blocks via `wait` (false = timed out). A worker woken by a producer was
-  // already un-announced by it; otherwise the worker withdraws its
-  // announcement, or, if a producer claimed it meanwhile, absorbs the post
-  // that producer makes. Returns an item found by the recheck, else none
-  // (the caller retries).
+  // Lists worker `w` as idle, rechecks the queues and, if still empty,
+  // blocks on its own baton via `wait` (false = timed out). A worker woken by
+  // a producer was already unlinked by it. Otherwise the worker unlinks
+  // itself, or, if a producer claimed it meanwhile, waits for that
+  // producer's post to its baton. Returns an item found by the recheck,
+  // else none (the caller retries).
   template <class Wait>
   folly::Optional<T> waitIdle(int w, Wait&& wait) {
     auto& sub = subs_[w];
-    sub.idle.fetch_add(1, std::memory_order_relaxed);
+    Waiter me;
+    {
+      std::lock_guard<MicroSpinLock> g(sub.lock);
+      me.next = sub.idleHead;
+      if (sub.idleHead) {
+        sub.idleHead->prev = &me;
+      }
+      sub.idleHead = &me;
+      me.listed = true;
+      sub.idle.fetch_add(1, std::memory_order_relaxed);
+    }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     auto item = tryDequeue(w);
-    if (item || !wait(sub.sem)) {
-      if (!decrementIfPositive(sub.idle)) {
-        sub.sem.wait();
+    if (item || !wait(me.baton)) {
+      bool claimed;
+      {
+        std::lock_guard<MicroSpinLock> g(sub.lock);
+        claimed = !me.listed;
+        if (!claimed) {
+          unlink(sub, me);
+        }
+      }
+      if (claimed) {
+        me.baton.wait();
       }
     }
     return item;
