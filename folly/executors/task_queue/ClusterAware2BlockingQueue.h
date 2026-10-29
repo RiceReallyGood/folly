@@ -64,6 +64,13 @@ struct ClusterAware2Options {
 // A claimed worker that already found another item in its recheck hands its
 // token on (claims another worker for the target, or counts an orphan).
 //
+// With ClusterAware2Options::grab, a claim of a remote worker for cluster c
+// also adds 1 to grabbable[c]. Before sleeping, an awake worker spends such a
+// token of another cluster of its NUMA node and takes the item itself; the
+// claimed worker spends one when it runs, and skips its target if none is
+// left. Tokens of one cluster are interchangeable, so the invariant becomes
+// items <= local claims + grabbable[c] + orphans[c].
+//
 // Workers and producers are mapped to clusters with callerCluster(), so pin
 // them with ClusterAffinityThreadFactory. Items added with a negative
 // priority (stop tasks) go to a shared queue taken only after every cluster
@@ -103,9 +110,17 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
       : topo_(topo),
         opts_(opts),
         subs_(std::max<size_t>(topo.size(), 1)),
-        numa_(subs_.size(), 0) {
+        numa_(subs_.size(), 0),
+        sameNuma_(subs_.size()) {
     for (size_t c = 0; c < topo.size(); ++c) {
       numa_[c] = topo.clusters()[c].numaNode;
+    }
+    for (size_t c = 0; c < topo.size(); ++c) {
+      for (int n : topo.clusters()[c].neighbors) {
+        if (numa_[n] == numa_[c]) {
+          sameNuma_[c].push_back(n);
+        }
+      }
     }
   }
 
@@ -166,6 +181,10 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
 
   int64_t orphansOf(int cluster) const {
     return subs_[cluster].orphans.load(std::memory_order_relaxed);
+  }
+
+  int64_t grabbableOf(int cluster) const {
+    return subs_[cluster].grabbable.load(std::memory_order_relaxed);
   }
 
   Stats stats() const {
@@ -249,6 +268,9 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
         false};
     alignas(hardware_destructive_interference_size) std::atomic<int64_t>
         orphans{0};
+    // Claims of remote workers for this cluster's items, not yet spent (grab).
+    alignas(hardware_destructive_interference_size) std::atomic<int64_t>
+        grabbable{0};
     alignas(hardware_destructive_interference_size) Counters counters;
   };
 
@@ -327,6 +349,9 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
           d == target                   ? c.assignLocal
               : numa_[d] == numa_[target] ? c.assignSameNuma
                                           : c.assignOtherNuma);
+      if (opts_.grab && d != target) {
+        subs_[target].grabbable.fetch_add(1, std::memory_order_seq_cst);
+      }
       waiter->claimedAt = hardware_timestamp();
     }
     waiter->target = target;
@@ -382,6 +407,10 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
     }
     Counters& c = subs_[h].counters;
     recordWake(c, t == h, me.claimedAt);
+    if (!spendRemoteClaim(h, t)) {
+      bump(c.grabSkips);
+      return folly::none;
+    }
     if (auto item = subs_[t].queue.try_dequeue()) {
       bump(t == h ? c.localTakes : c.stolenTakes);
       return item;
@@ -391,7 +420,8 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
   }
 
   // Steps 2-4: own queue, then orphaned items (own cluster, then by
-  // distance), then LO_PRI items.
+  // distance), then (grab) remotely claimed items of the NUMA node, then
+  // LO_PRI items.
   folly::Optional<T> tryOthers(int h) {
     Sub& sub = subs_[h];
     if (auto item = sub.queue.try_dequeue()) {
@@ -411,7 +441,35 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
         return item;
       }
     }
+    if (opts_.grab) {
+      // The own queue was just found empty, so only other clusters.
+      for (int d : sameNuma_[h]) {
+        if (auto item = grab(h, d)) {
+          return item;
+        }
+      }
+    }
     return lowPri_.try_dequeue();
+  }
+
+  folly::Optional<T> grab(int h, int d) {
+    if (!tryDec(subs_[d].grabbable)) {
+      return folly::none;
+    }
+    Counters& c = subs_[h].counters;
+    if (auto item = subs_[d].queue.try_dequeue()) {
+      bump(c.grabTakes);
+      bump(c.stolenTakes);
+      return item;
+    }
+    bump(c.grabMisses);
+    return folly::none;
+  }
+
+  // A worker of `h` claimed for `t` takes over its claim's token; with grab
+  // and a remote claim, false if another worker already spent it.
+  bool spendRemoteClaim(int h, int t) {
+    return !opts_.grab || t == h || tryDec(subs_[t].grabbable);
   }
 
   folly::Optional<T> takeOrphan(int h, int d) {
@@ -432,6 +490,10 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
   void handOff(int h, const Waiter& me) {
     if (me.target == kNoTarget) {
       return; // LO_PRI: the worker reads the shared queue before sleeping
+    }
+    if (!spendRemoteClaim(h, me.target)) {
+      bump(subs_[h].counters.grabSkips);
+      return; // another worker took over the token
     }
     bump(subs_[h].counters.handoffs);
     assignToken(me.target);
@@ -508,6 +570,8 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
   const ClusterAware2Options opts_;
   std::vector<Sub> subs_;
   std::vector<int> numa_; // NUMA node of each cluster
+  // Other clusters of each cluster's NUMA node, nearest first.
+  std::vector<std::vector<int>> sameNuma_;
   UMPMCQueue<T, false, 6> lowPri_;
 };
 

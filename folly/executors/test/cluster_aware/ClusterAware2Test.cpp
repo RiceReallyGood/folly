@@ -63,7 +63,7 @@ bool noStaleTokens(Queue& q, int workers) {
     return false;
   }
   for (int c = 0; c < 4; ++c) {
-    if (q.orphansOf(c) != 0) {
+    if (q.orphansOf(c) != 0 || q.grabbableOf(c) != 0) {
       return false;
     }
   }
@@ -75,7 +75,8 @@ void expectNoStaleTokens(Queue& q, int workers) {
   EXPECT_TRUE(waitUntil([&] { return noStaleTokens(q, workers); }, 5000ms))
       << "queued " << q.size() << " idle " << q.idleWorkers() << " orphans "
       << q.orphansOf(0) << "," << q.orphansOf(1) << "," << q.orphansOf(2)
-      << "," << q.orphansOf(3);
+      << "," << q.orphansOf(3) << " grabbable " << q.grabbableOf(0) << ","
+      << q.grabbableOf(1) << "," << q.grabbableOf(2) << "," << q.grabbableOf(3);
 }
 
 // Worker A (home aHome) runs a blocker while an item is added to cluster 0,
@@ -288,6 +289,28 @@ TEST(ClusterAware2BlockingQueue, AwakeWorkerNeverTakesRemotelyAssignedItem) {
   EXPECT_EQ(q.stats().grabTakes, 0);
 }
 
+// CA2-G: an awake worker of the same NUMA node takes the item instead of
+// waiting for the claimed remote worker to come back on a CPU, and the
+// claimed worker, finding the token spent, skips the useless probe.
+TEST(ClusterAware2GrabBlockingQueue, AwakeSameNumaWorkerGrabsRemotelyAssignedItem) {
+  FnQueue q(fourClusters(), ClusterAware2Options{true});
+  int onA = 0;
+  runWithTimeout([&] { onA = runGrabTrials(q, 1, 2, 20); }, 60s);
+  EXPECT_GE(onA, 1);
+  auto s = q.stats();
+  EXPECT_GE(s.grabTakes, 1);
+  EXPECT_GE(s.grabSkips, 1);
+  EXPECT_EQ(q.grabbableOf(0), 0);
+}
+
+TEST(ClusterAware2GrabBlockingQueue, GrabIsLimitedToSameNuma) {
+  FnQueue q(fourClusters(), ClusterAware2Options{true});
+  int onA = 0;
+  runWithTimeout([&] { onA = runGrabTrials(q, 2, 1, 20); }, 60s);
+  EXPECT_EQ(onA, 0);
+  EXPECT_EQ(q.stats().grabTakes, 0);
+}
+
 class ClusterAware2Stress : public ::testing::TestWithParam<bool> {
  protected:
   ClusterAware2Options opts() const { return ClusterAware2Options{GetParam()}; }
@@ -468,7 +491,7 @@ TEST_P(ClusterAware2Stress, ClaimRaceExercisesHandoff) {
 INSTANTIATE_TEST_SUITE_P(
     Policies,
     ClusterAware2Stress,
-    ::testing::Values(false),
+    ::testing::Values(false, true),
     [](const ::testing::TestParamInfo<bool>& info) {
       return info.param ? "Grab" : "NoGrab";
     });
