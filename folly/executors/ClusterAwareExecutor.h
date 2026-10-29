@@ -26,6 +26,7 @@
 
 #include <folly/ExceptionString.h>
 #include <folly/Executor.h>
+#include <folly/executors/task_queue/ClusterAware2BlockingQueue.h>
 #include <folly/executors/task_queue/ClusterAwareBlockingQueue.h>
 #include <folly/executors/thread_factory/ThreadFactory.h>
 #include <folly/io/async/Request.h>
@@ -33,10 +34,10 @@
 namespace folly {
 
 // A lean fixed-size pool whose workers run tasks from a cluster-aware
-// `Queue` (e.g. ClusterAwareBlockingQueue<Func>) keyed by `queueTopo`. Unlike
-// CPUThreadPoolExecutor it keeps no per-task bookkeeping and does not count
-// keep-alives, so the only state shared between producers and workers is the
-// queue. With a single-cluster `queueTopo` it is a plain global-queue pool.
+// `Queue` (ClusterAwareBlockingQueue<Func> or ClusterAware2BlockingQueue<Func>)
+// keyed by `queueTopo`. Unlike CPUThreadPoolExecutor it keeps no per-task
+// bookkeeping and does not count keep-alives, so the only state shared
+// between producers and workers is the queue. With a single-cluster `queueTopo` it is a plain global-queue pool.
 // The RequestContext of add() is restored while the task runs.
 template <class Queue>
 class BasicClusterAwareExecutor : public Executor {
@@ -104,5 +105,7 @@ class BasicClusterAwareExecutor : public Executor {
 
 using ClusterAwareExecutor =
     BasicClusterAwareExecutor<ClusterAwareBlockingQueue<Func>>;
+using ClusterAware2Executor =
+    BasicClusterAwareExecutor<ClusterAware2BlockingQueue<Func>>;
 
 } // namespace folly
