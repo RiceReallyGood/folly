@@ -30,10 +30,21 @@
 #include <folly/executors/ClusterTopology.h>
 #include <folly/executors/task_queue/BlockingQueue.h>
 #include <folly/lang/Align.h>
-#include <folly/synchronization/Baton.h>
 #include <folly/synchronization/MicroSpinLock.h>
+#include <folly/synchronization/SaturatingSemaphore.h>
 
 namespace folly {
+
+// Interleaving points for tests; the default does nothing.
+struct ClusterAware2NoHooks {
+  // A worker of `cluster` took an item from its own queue.
+  static void afterOwnQueueTake(int /* cluster */) {}
+  // A worker of `cluster` found no cluster item and is about to look at the
+  // LO_PRI queue.
+  static void beforeLowPri(int /* cluster */) {}
+  // A producer unlinked an idle worker of `cluster`, before waking it.
+  static void afterClaimUnlink(int /* cluster */) {}
+};
 
 struct ClusterAware2Options {
   // An awake idle worker may take an item of another cluster of its NUMA
@@ -56,7 +67,9 @@ struct ClusterAware2Options {
 //   items in c's queue <= unspent claims targeting c + orphans[c].
 //
 // A claimed worker first tries its target; every worker reads all orphans[]
-// before it sleeps. Two seq_cst fence pairings close the races:
+// before it sleeps. A worker spends a token before its attempt, never after
+// it: spending after a successful take could spend the token of an item
+// enqueued in between. Two seq_cst fence pairings close the races:
 //   A: producer "enqueue, fence, look for idle workers" against worker
 //      "list as idle, fence, recheck the queues";
 //   B: producer "orphans[c] += 1, fence, look again" against worker
@@ -74,8 +87,11 @@ struct ClusterAware2Options {
 // Workers and producers are mapped to clusters with callerCluster(), so pin
 // them with ClusterAffinityThreadFactory. Items added with a negative
 // priority (stop tasks) go to a shared queue taken only after every cluster
-// queue and orphan count is empty.
-template <class T>
+// item with a visible token: a worker that takes one looks at the cluster
+// items again (taking it made the tokens of every earlier item visible) and
+// puts it back if one turns up, and a claimed worker spends its claim before
+// stopping. LO_PRI items are therefore not strictly FIFO.
+template <class T, class Hooks = ClusterAware2NoHooks>
 class ClusterAware2BlockingQueue : public BlockingQueue<T> {
  public:
   static constexpr size_t kWakeBuckets = 11;
@@ -91,8 +107,7 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
     uint64_t assignSameNuma;
     uint64_t assignOtherNuma;
     uint64_t orphanAdds;
-    uint64_t orphanLocalDecs; // spent by a local take that found an item
-    uint64_t orphanTakes; // spent on another attempt that found an item
+    uint64_t orphanTakes; // spent on an attempt that found an item
     uint64_t orphanMisses; // spent on an attempt that found the queue empty
     uint64_t emptyTargetWakes; // claimed worker found its target empty
     uint64_t handoffs;
@@ -145,8 +160,8 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
   }
 
   T take() override {
-    return std::move(*takeOrWait([](Baton<>& baton) {
-      baton.wait();
+    return std::move(*takeOrWait([](Wakeup& wakeup) {
+      wakeup.wait();
       return true;
     }));
   }
@@ -154,7 +169,7 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
   folly::Optional<T> try_take_for(std::chrono::milliseconds time) override {
     auto deadline = std::chrono::steady_clock::now() + time;
     return takeOrWait(
-        [&](Baton<>& baton) { return baton.try_wait_until(deadline); });
+        [&](Wakeup& wakeup) { return wakeup.try_wait_until(deadline); });
   }
 
   size_t size() override {
@@ -200,7 +215,6 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
       sum(s.assignSameNuma, c.assignSameNuma);
       sum(s.assignOtherNuma, c.assignOtherNuma);
       sum(s.orphanAdds, c.orphanAdds);
-      sum(s.orphanLocalDecs, c.orphanLocalDecs);
       sum(s.orphanTakes, c.orphanTakes);
       sum(s.orphanMisses, c.orphanMisses);
       sum(s.emptyTargetWakes, c.emptyTargetWakes);
@@ -219,10 +233,14 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
  private:
   static constexpr int kNoTarget = -1; // claimed for a LO_PRI item
 
+  // Unlike a Baton, it can be waited on again after a timed-out wait, as a
+  // worker claimed while timing out must (default spin: 2us, as Baton).
+  using Wakeup = SaturatingSemaphore</* MayBlock */ true>;
+
   // An idle worker blocked in take(); lives on that worker's stack. A
   // producer that claims it writes `target` and `claimedAt` before the post.
   struct Waiter {
-    Baton<> baton;
+    Wakeup wakeup;
     Waiter* prev{nullptr};
     Waiter* next{nullptr};
     bool listed{false};
@@ -239,7 +257,6 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
     std::atomic<uint64_t> assignSameNuma{0};
     std::atomic<uint64_t> assignOtherNuma{0};
     std::atomic<uint64_t> orphanAdds{0};
-    std::atomic<uint64_t> orphanLocalDecs{0};
     std::atomic<uint64_t> orphanTakes{0};
     std::atomic<uint64_t> orphanMisses{0};
     std::atomic<uint64_t> emptyTargetWakes{0};
@@ -343,6 +360,7 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
       }
       unlink(sub, *waiter);
     }
+    Hooks::afterClaimUnlink(d);
     if (target != kNoTarget) {
       Counters& c = subs_[target].counters;
       bump(
@@ -355,7 +373,7 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
       waiter->claimedAt = hardware_timestamp();
     }
     waiter->target = target;
-    waiter->baton.post();
+    waiter->wakeup.post();
     return true;
   }
 
@@ -419,21 +437,41 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
     return folly::none;
   }
 
-  // Steps 2-4: own queue, then orphaned items (own cluster, then by
-  // distance), then (grab) remotely claimed items of the NUMA node, then
-  // LO_PRI items.
-  folly::Optional<T> tryOthers(int h) {
-    Sub& sub = subs_[h];
-    if (auto item = sub.queue.try_dequeue()) {
-      bump(sub.counters.localTakes);
-      // The item may have been an orphan; spending its token saves a remote
-      // worker a useless probe. Safe: both sides of the invariant drop by 1.
-      if (tryDec(sub.orphans)) {
-        bump(sub.counters.orphanLocalDecs);
-      }
+  // Steps 2-4: cluster items (tryClusters), then a LO_PRI item.
+  // `*fromLowPri` tells whether the item is a LO_PRI one.
+  folly::Optional<T> tryOthers(int h, bool* fromLowPri = nullptr) {
+    if (auto item = tryClusters(h)) {
       return item;
     }
+    Hooks::beforeLowPri(h);
+    auto lowPri = lowPri_.try_dequeue();
+    if (!lowPri) {
+      return folly::none;
+    }
+    // Taking it synchronized with its producer, so the tokens of every item
+    // enqueued before it are visible now.
+    if (auto item = tryClusters(h)) {
+      lowPri_.enqueue(std::move(*lowPri));
+      return item;
+    }
+    if (fromLowPri) {
+      *fromLowPri = true;
+    }
+    return lowPri;
+  }
+
+  // Own queue (spending an orphan token on it first if there is one: the
+  // item may be an orphan, and a remote worker is then spared the probe),
+  // orphaned items of the other clusters by distance, then (grab) remotely
+  // claimed items of the NUMA node.
+  folly::Optional<T> tryClusters(int h) {
+    Sub& sub = subs_[h];
     if (auto item = takeOrphan(h, h)) {
+      return item;
+    }
+    if (auto item = sub.queue.try_dequeue()) {
+      Hooks::afterOwnQueueTake(h);
+      bump(sub.counters.localTakes);
       return item;
     }
     for (int d : neighbors(h)) {
@@ -449,7 +487,7 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
         }
       }
     }
-    return lowPri_.try_dequeue();
+    return folly::none;
   }
 
   folly::Optional<T> grab(int h, int d) {
@@ -478,6 +516,9 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
     }
     Counters& c = subs_[h].counters;
     if (auto item = subs_[d].queue.try_dequeue()) {
+      if (d == h) {
+        Hooks::afterOwnQueueTake(h);
+      }
       bump(c.orphanTakes);
       bump(d == h ? c.localTakes : c.stolenTakes);
       return item;
@@ -521,7 +562,7 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
 #endif
   }
 
-  // Runs the worker steps until an item turns up. `wait(baton)` blocks until
+  // Runs the worker steps until an item turns up. `wait(wakeup)` blocks until
   // a producer claims this worker, or returns false on timeout; then one
   // more attempt is made and its result returned.
   template <class Wait>
@@ -538,21 +579,27 @@ class ClusterAware2BlockingQueue : public BlockingQueue<T> {
       }
       // Pairings A and B, worker side.
       std::atomic_thread_fence(std::memory_order_seq_cst);
-      if (auto item = tryOthers(h)) {
+      bool lowPri = false;
+      if (auto item = tryOthers(h, &lowPri)) {
         if (!unlistSelf(h, me)) {
-          // Claimed meanwhile: wait until the producer is done with `me`,
-          // then pass on the token, which this worker will not spend.
-          me.baton.wait();
-          handOff(h, me);
+          // Claimed meanwhile: wait until the producer is done with `me`.
+          me.wakeup.wait();
+          if (!lowPri) {
+            handOff(h, me); // this worker will not spend the token
+          } else if (auto target = takeTarget(h, me)) {
+            // Never stop while holding a claim: its item may be the last.
+            lowPri_.enqueue(std::move(*item));
+            return target;
+          }
         }
         return item;
       }
-      const bool posted = wait(me.baton);
+      const bool posted = wait(me.wakeup);
       if (!posted) {
         if (unlistSelf(h, me)) {
           return tryOthers(h);
         }
-        me.baton.wait(); // claimed while timing out: spend the token below
+        me.wakeup.wait(); // claimed while timing out: spend the token below
       }
       if (auto item = takeTarget(h, me)) {
         return item;

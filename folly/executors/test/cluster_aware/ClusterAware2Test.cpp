@@ -134,7 +134,7 @@ TEST(ClusterAware2BlockingQueue, LocalFirst) {
   auto s = q.stats();
   EXPECT_EQ(s.localTakes, 2);
   EXPECT_EQ(s.orphanAdds, 2);
-  EXPECT_EQ(s.orphanLocalDecs, 2);
+  EXPECT_EQ(s.orphanTakes, 2); // spent before each take
   EXPECT_EQ(q.orphansOf(1), 0);
 }
 
@@ -309,6 +309,171 @@ TEST(ClusterAware2GrabBlockingQueue, GrabIsLimitedToSameNuma) {
   runWithTimeout([&] { onA = runGrabTrials(q, 2, 1, 20); }, 60s);
   EXPECT_EQ(onA, 0);
   EXPECT_EQ(q.stats().grabTakes, 0);
+}
+
+// Hooks that pause a worker at one interleaving point so that a test can
+// slip producer and worker actions in between. Set before the threads start
+// and cleared (HookReset) after they are joined.
+struct TestHooks {
+  static inline std::function<void(int)> ownQueueTake;
+  static inline std::function<void(int)> lowPri;
+  static inline std::function<void(int)> claimUnlink;
+  static void afterOwnQueueTake(int c) {
+    if (ownQueueTake) {
+      ownQueueTake(c);
+    }
+  }
+  static void beforeLowPri(int c) {
+    if (lowPri) {
+      lowPri(c);
+    }
+  }
+  static void afterClaimUnlink(int c) {
+    if (claimUnlink) {
+      claimUnlink(c);
+    }
+  }
+};
+
+struct HookReset {
+  ~HookReset() {
+    TestHooks::ownQueueTake = nullptr;
+    TestHooks::lowPri = nullptr;
+    TestHooks::claimUnlink = nullptr;
+  }
+};
+
+using HookedQueue = ClusterAware2BlockingQueue<int, TestHooks>;
+
+// Pauses the `nth` call of a hook until resume() is called.
+class PauseAt {
+ public:
+  explicit PauseAt(int nth) : nth_(nth) {}
+  std::function<void(int)> hook() {
+    return [this](int) {
+      if (++calls_ == nth_) {
+        paused_.set_value();
+        resume_.wait();
+      }
+    };
+  }
+  void waitPaused() { paused_.get_future().wait(); }
+  void resume() { resumePromise_.set_value(); }
+
+ private:
+  const int nth_;
+  std::atomic<int> calls_{0};
+  std::promise<void> paused_;
+  std::promise<void> resumePromise_;
+  std::shared_future<void> resume_{resumePromise_.get_future().share()};
+};
+
+// Takes items until a negative one (a stop item), which it records too.
+std::vector<int> takeUntilStop(HookedQueue& q, int home) {
+  HomeCluster h(home);
+  std::vector<int> got;
+  int v;
+  do {
+    v = q.take();
+    got.push_back(v);
+  } while (v >= 0);
+  return got;
+}
+
+// A worker that took an item from its own queue must not then spend a token
+// that belongs to an item enqueued meanwhile: that item would stay queued
+// with nobody to take it while workers sleep.
+TEST(ClusterAware2Interleaving, LocalTakeNeverSpendsALaterItemsToken) {
+  HookReset reset;
+  HookedQueue q(fourClusters());
+  q.addToCluster(1, 1); // no worker anywhere: orphans[1] = 1
+  PauseAt pause(1);
+  TestHooks::ownQueueTake = pause.hook();
+  std::promise<int> got;
+  std::thread l([&] {
+    HomeCluster home(1);
+    got.set_value(q.take());
+  });
+  pause.waitPaused(); // l has taken item 1 from its own queue
+  {
+    HomeCluster home(0); // a worker elsewhere about to sleep, finding nothing
+    EXPECT_FALSE(q.try_take_for(0ms).has_value());
+  }
+  q.addToCluster(1, 2); // still no idle worker: item 2 gets orphans[1]
+  pause.resume();
+  EXPECT_EQ(got.get_future().get(), 1);
+  l.join();
+  EXPECT_EQ(q.orphansOf(1), 1) << "item 2 lost its token";
+  HomeCluster home(0);
+  auto item = q.try_take_for(0ms);
+  EXPECT_TRUE(item.has_value() && *item == 2);
+}
+
+// try_take_for times out while a producer is between claiming the worker
+// and waking it: the worker must still take the item it was claimed for.
+TEST(ClusterAware2Interleaving, TimedOutWorkerThatWasClaimedTakesItsItem) {
+  HookReset reset;
+  HookedQueue q(fourClusters());
+  std::atomic<bool> delay{true};
+  TestHooks::claimUnlink = [&](int) {
+    if (delay.exchange(false)) {
+      std::this_thread::sleep_for(100ms); // the worker's 20ms run out
+    }
+  };
+  std::promise<folly::Optional<int>> got;
+  std::promise<void> mayExit; // keeps w's stack alive if the item is lost
+  std::thread w([&] {
+    HomeCluster home(2);
+    got.set_value(q.try_take_for(20ms));
+    mayExit.get_future().wait();
+  });
+  ASSERT_TRUE(waitUntil([&] { return q.idleWorkers() == 1; }, 1000ms));
+  q.addToCluster(0, 42); // claims w, wakes it 100ms later
+  auto f = got.get_future();
+  bool ready = f.wait_for(1s) == std::future_status::ready;
+  EXPECT_TRUE(ready);
+  if (ready) {
+    auto item = f.get();
+    EXPECT_TRUE(item.has_value() && *item == 42);
+  }
+  mayExit.set_value();
+  w.join();
+}
+
+// The only worker, claimed for an item while it rechecks, finds a stop item
+// (LO_PRI) instead: it must run the item it was claimed for before stopping,
+// or the item is never run.
+TEST(ClusterAware2Interleaving, ClaimedWorkerRunsItsItemBeforeStopping) {
+  HookReset reset;
+  HookedQueue q(fourClusters());
+  PauseAt pause(2); // 1: first pass, 2: recheck after listing as idle
+  TestHooks::lowPri = pause.hook();
+  std::vector<int> got;
+  std::thread w([&] { got = takeUntilStop(q, 2); });
+  pause.waitPaused();
+  q.addToCluster(0, 42); // claims w, which is listed
+  q.addWithPriority(-1, Executor::LO_PRI); // nobody idle to claim
+  pause.resume();
+  w.join();
+  EXPECT_EQ(got, (std::vector<int>{42, -1}));
+}
+
+// The only worker found no item and no token, and is about to read the
+// LO_PRI queue, when an item (an orphan: nobody idle) and then a stop item
+// are added: it must run the item before stopping.
+TEST(ClusterAware2Interleaving, StopItemNeverOvertakesAnEarlierItem) {
+  HookReset reset;
+  HookedQueue q(fourClusters());
+  PauseAt pause(1);
+  TestHooks::lowPri = pause.hook();
+  std::vector<int> got;
+  std::thread w([&] { got = takeUntilStop(q, 2); });
+  pause.waitPaused();
+  q.addToCluster(0, 42); // w is not listed: orphans[0] = 1
+  q.addWithPriority(-1, Executor::LO_PRI);
+  pause.resume();
+  w.join();
+  EXPECT_EQ(got, (std::vector<int>{42, -1}));
 }
 
 class ClusterAware2Stress : public ::testing::TestWithParam<bool> {
