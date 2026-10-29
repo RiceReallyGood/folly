@@ -25,39 +25,11 @@
 #include <folly/executors/ClusterTopology.h>
 #include <gtest/gtest.h>
 
-#include "FakeSysfs.h"
 #include "TestUtil.h"
 
 using namespace folly;
 using namespace folly::test;
 using namespace std::chrono_literals;
-
-namespace {
-// 2 NUMA nodes x 2 clusters: neighbors(0) = {1, 2, 3}, neighbors(1) = {0, 2, 3},
-// neighbors(2) = {3, 0, 1}, neighbors(3) = {2, 0, 1}.
-const ClusterTopology& fourClusters() {
-  static const ClusterTopology topo = ClusterTopology::detect(
-      makeFakeSysfs(fourClusterLayout(), fourClusterDistances()), range(0, 15));
-  return topo;
-}
-
-// Resets the calling thread's home cluster when it goes out of scope.
-struct HomeCluster {
-  explicit HomeCluster(int c) { setCurrentThreadCluster(c); }
-  ~HomeCluster() { setCurrentThreadCluster(-1); }
-};
-
-bool waitUntil(const std::function<bool()>& pred, std::chrono::milliseconds limit) {
-  auto deadline = std::chrono::steady_clock::now() + limit;
-  while (!pred()) {
-    if (std::chrono::steady_clock::now() > deadline) {
-      return false;
-    }
-    std::this_thread::sleep_for(1ms);
-  }
-  return true;
-}
-} // namespace
 
 TEST(ClusterAwareBlockingQueue, LocalFirstThenNearestSteal) {
   ClusterAwareBlockingQueue<int> q(fourClusters());
